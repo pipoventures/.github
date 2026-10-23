@@ -1,0 +1,168 @@
+name: No AI attribution
+
+# Refuses AI attribution in what a pull request will land: a Co-Authored-By
+# naming a model or a version, a "Generated with <model>" footer, or a trailer
+# whose key names a model (a Claude-Session link). Contract: mnemosyne#ACT-139.
+#
+# The rule is the one mnemosyne/scripts/global-hooks/commit-msg enforces on
+# Mario's machine (registry T29). That hook binds one machine; cloud sessions
+# (T23) and GitHub-side merges never run it, and both have landed trailers on
+# main. This check binds every writer, because each repo's ruleset requires it.
+#
+# REUSABLE: each repo calls this from a thin .github/workflows/ai-attribution.yml,
+# pinned to a full commit SHA of this file. A pin, not @main: this repo has no
+# ruleset, so a push here would otherwise change the gate in every repo with
+# nothing in their diffs to show it. A change here lands in a repo only when its
+# pin is bumped by pull request.
+#
+# WHAT IT EXAMINES. On pull_request: every commit the PR adds (its head, minus
+# what the base branch already has), and the PR title and body, which GitHub
+# uses to compose merge and squash messages. On push to main: the pushed range,
+# after the fact. That run cannot block (the commit has landed) and exists to
+# make a trailer that got past the PR check visible: it fails, and Slack hears.
+#
+# WHAT IT CANNOT SEE. The final squash or merge message is composed at merge
+# time, after this check has run, and is editable in the merge dialog. GitHub
+# also appends a Co-authored-by trailer to a squash commit for every other
+# commit author, so a PR of commits authored "Claude <noreply@anthropic.com>"
+# lands a trailer even when every message is clean (plyego #115 and #116 each
+# carry one, below the trailers squashed in from their commits). Model-named authors are warned about, not refused (a ruling
+# for Mario, mnemosyne#ACT-139); the push run catches what lands.
+#
+# Shell only: grep's ERE is the hook's own matcher, so the patterns below are
+# the hook's strings, not a translation of them.
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  trailers:
+    name: trailers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the calling repo (full history)
+        # Full history: the PR range is resolved against origin/<base>, which a
+        # shallow clone would not hold.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse AI attribution in commit messages and the PR title and body
+        # Event fields reach the script through env, never interpolated into it:
+        # a PR title is attacker-controlled text on a public repo.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          # Actions runs this under `bash -e`; grep's no-match status is not an
+          # error here, so -e is switched off and failure is decided explicitly.
+          set +e -uo pipefail
+
+          # Kept in step with mnemosyne/scripts/global-hooks/commit-msg: same vendor
+          # list, same version token, same Co-Authored-By pipeline. Change both together.
+          MODEL_RE='claude|anthropic|openai|chatgpt|gpt-|copilot|gemini|deepseek|codex|cursor|devin|llama|mistral|sonnet|opus|haiku|fable|bard|grok'
+          VERSION_RE='[0-9]+\.[0-9]+'
+
+          # Prints each offending fragment of the message in file $1, one per line.
+          scan() {
+            # 1. The machine hook's rule: a Co-Authored-By whose value names a model or
+            #    a version. Matched mid-line and in any case, as the hook does. Unlike
+            #    the hook, '#' lines are NOT stripped: git has already discarded comment
+            #    lines from a committed message, so any left are real content (and a PR
+            #    body's Markdown headings start with '#').
+            grep -oiE 'co-authored-by:[^<]*(<[^>]*>)?' "$1" \
+            | while IFS= read -r hit; do
+                value=${hit#*:}
+                if printf '%s' "$value" | grep -qiE "$MODEL_RE" \
+                || printf '%s' "$value" | grep -qE "$VERSION_RE"; then
+                  printf '%s\n' "$hit"
+                fi
+              done
+            # 2. A "Generated with <model>" footer, e.g. the Claude Code one.
+            grep -oiE "generated (with|by) \[?($MODEL_RE)[^]()]*" "$1"
+            # 3. A trailer whose key names a model, e.g. a Claude-Session link.
+            grep -iE "^[[:space:]]*($MODEL_RE)[a-z0-9]*-[a-z0-9-]+:" "$1"
+          }
+
+          work=$(mktemp -d)
+          fail=0
+          summary=()
+
+          check() {  # $1 label, $2 message file
+            local hits
+            hits=$(scan "$2" | sort -u)
+            if [ -n "$hits" ]; then
+              fail=1
+              echo "::error::$1 carries AI attribution:"
+              printf '%s\n' "$hits" | sed 's/^/    /'
+              summary+=("- **$1**: $(printf '%s' "$hits" | tr '\n' ' ')")
+            fi
+          }
+
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              if ! commits=$(git rev-list "$HEAD_SHA" --not "origin/$BASE_REF" 2>/dev/null); then
+                commits=$(git rev-list "$BASE_SHA..$HEAD_SHA") || { echo "::error::cannot resolve the PR's commit range"; exit 1; }
+              fi
+              printf '%s\n' "$PR_TITLE" "$PR_BODY" > "$work/pr"
+              check "PR title or body" "$work/pr"
+              what="the PR title and body"
+              ;;
+            push)
+              if [ -z "${BEFORE//0/}" ]; then
+                commits=$(git rev-list -1 "$AFTER")
+              else
+                commits=$(git rev-list "$BEFORE..$AFTER") || { echo "::error::cannot resolve the pushed range"; exit 1; }
+              fi
+              what="no PR (push event)"
+              ;;
+            *)
+              echo "::error::unsupported event '$EVENT'"; exit 1 ;;
+          esac
+
+          n=0
+          for sha in $commits; do
+            n=$((n + 1))
+            git log -1 --format=%B "$sha" > "$work/msg"
+            check "commit ${sha:0:12} ($(git log -1 --format=%s "$sha" | cut -c1-60))" "$work/msg"
+            # Not refused, but warned: GitHub appends a Co-authored-by trailer for each
+            # other commit author when it squash-merges, after this check has run.
+            ident=$(git log -1 --format='%an <%ae>%n%cn <%ce>' "$sha")
+            if printf '%s' "$ident" | grep -qiE "$MODEL_RE"; then
+              echo "::warning::commit ${sha:0:12} has a model-named author or committer ($(printf '%s' "$ident" | head -1)). A squash merge would append a Co-authored-by trailer for it that this check cannot see."
+            fi
+          done
+
+          # Liveness: say what was examined, so a pass is distinguishable from a no-op.
+          echo "Scanned $n commit(s) and $what."
+          {
+            echo "### AI attribution check"
+            echo "Scanned $n commit(s) and $what."
+            if [ "$fail" -eq 1 ]; then printf '%s\n' "**Refused:**" "${summary[@]}"; else echo "No AI attribution found."; fi
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::Remove AI attribution from the messages above: amend or reword the commits (git rebase -i, or git commit --amend for the tip) and force-push the branch; edit the PR title or body. A Co-Authored-By naming a human is allowed. Rule: mnemosyne#ACT-139."
+            exit 1
+          fi
+
+      - name: Notify Slack on failure
+        # Needs the caller to pass `secrets: inherit`.
+        if: failure()
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_ALERTS }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: ":red_circle: *${{ github.repository }}* — `${{ github.workflow }}` failed on `${{ github.ref_name }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
